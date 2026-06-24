@@ -1,0 +1,212 @@
+name: Build APK from Web2APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Website URL'
+        required: false
+        type: string
+      app_name:
+        description: 'App Name'
+        required: true
+        type: string
+      package_name:
+        description: 'Package Name'
+        required: true
+        type: string
+      user_id:
+        description: 'Telegram User ID'
+        required: true
+        type: string
+      zip_url:
+        description: 'ZIP URL (for Flutter projects)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.0'
+          channel: 'stable'
+
+      - name: Setup Android SDK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip
+          wget https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip
+          unzip commandlinetools-linux-9477386_latest.zip -d android-sdk
+          mkdir -p android-sdk/cmdline-tools/latest
+          mv android-sdk/cmdline-tools/* android-sdk/cmdline-tools/latest/ || true
+          export ANDROID_SDK_ROOT=$PWD/android-sdk
+          export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
+          echo "y" | sdkmanager "platforms;android-33" "build-tools;33.0.0"
+
+      - name: Get Project Source
+        id: get_source
+        run: |
+          if [ -n "${{ github.event.inputs.zip_url }}" ]; then
+            echo "📦 Downloading ZIP from: ${{ github.event.inputs.zip_url }}"
+            wget -O project.zip "${{ github.event.inputs.zip_url }}"
+            unzip -o project.zip -d project/
+          elif [ -n "${{ github.event.inputs.url }}" ]; then
+            echo "🌐 Cloning website from: ${{ github.event.inputs.url }}"
+            git clone "${{ github.event.inputs.url }}" project/ || true
+          else
+            echo "❌ No source provided!"
+            exit 1
+          fi
+
+      - name: Check if Flutter Project
+        id: check_flutter
+        run: |
+          if [ -f "project/pubspec.yaml" ]; then
+            echo "✅ Flutter project detected"
+            echo "is_flutter=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Not a Flutter project"
+            echo "is_flutter=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build WebView APK (Non-Flutter)
+        if: steps.check_flutter.outputs.is_flutter == 'false'
+        run: |
+          # Buat project Flutter minimal dengan WebView
+          flutter create --org com.web2apk --project-name app_build webview_app
+          cd webview_app
+          
+          # Tambah webview_flutter
+          echo "dependencies:
+            flutter:
+              sdk: flutter
+            webview_flutter: ^4.4.2" >> pubspec.yaml
+          
+          # Setup main.dart dengan WebView
+          cat > lib/main.dart << 'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: '${{ github.event.inputs.app_name }}',
+                theme: ThemeData(primarySwatch: Colors.blue),
+                home: const WebViewScreen(),
+              );
+            }
+          }
+
+          class WebViewScreen extends StatefulWidget {
+            const WebViewScreen({super.key});
+
+            @override
+            State<WebViewScreen> createState() => _WebViewScreenState();
+          }
+
+          class _WebViewScreenState extends State<WebViewScreen> {
+            late final WebViewController controller;
+            bool isLoading = true;
+
+            @override
+            void initState() {
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (url) => setState(() => isLoading = true),
+                    onPageFinished: (url) => setState(() => isLoading = false),
+                  ),
+                )
+                ..loadRequest(Uri.parse('${{ github.event.inputs.url }}'));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: Text('${{ github.event.inputs.app_name }}'),
+                  backgroundColor: Colors.blue,
+                  foregroundColor: Colors.white,
+                ),
+                body: Stack(
+                  children: [
+                    WebViewWidget(controller: controller),
+                    if (isLoading)
+                      const Center(child: CircularProgressIndicator()),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+          
+          flutter pub get
+          flutter build apk --release
+
+      - name: Build Flutter Project
+        if: steps.check_flutter.outputs.is_flutter == 'true'
+        run: |
+          cd project
+          flutter pub get
+          flutter build apk --release
+
+      - name: Rename APK
+        run: |
+          APK_PATH=""
+          if [ -f "webview_app/build/app/outputs/flutter-apk/app-release.apk" ]; then
+            APK_PATH="webview_app/build/app/outputs/flutter-apk/app-release.apk"
+          elif [ -f "project/build/app/outputs/flutter-apk/app-release.apk" ]; then
+            APK_PATH="project/build/app/outputs/flutter-apk/app-release.apk"
+          fi
+          
+          if [ -n "$APK_PATH" ]; then
+            cp "$APK_PATH" "${{ github.event.inputs.app_name }}.apk"
+            echo "✅ APK saved as: ${{ github.event.inputs.app_name }}.apk"
+          else
+            echo "❌ No APK found!"
+            exit 1
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.app_name }}
+          path: ${{ github.event.inputs.app_name }}.apk
+          retention-days: 7
+
+      - name: Notify Telegram (Success)
+        if: success()
+        run: |
+          echo "✅ Build successful for user: ${{ github.event.inputs.user_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ github.event.inputs.user_id }}" \
+            -d text="✅ Build APK selesai! Downloading file..."
+
+      - name: Notify Telegram (Failed)
+        if: failure()
+        run: |
+          echo "❌ Build failed for user: ${{ github.event.inputs.user_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ github.event.inputs.user_id }}" \
+            -d text="❌ Build APK gagal! Cek project Anda."
