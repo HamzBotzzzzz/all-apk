@@ -42,124 +42,126 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.24.0'
+          flutter-version: '3.22.3'
           channel: 'stable'
 
       - name: Setup Android SDK
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq wget unzip
-          
-          # Download Android Command Line Tools
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q commandlinetools-linux-11076708_latest.zip -d android-sdk
-          mkdir -p android-sdk/cmdline-tools/latest
-          mv android-sdk/cmdline-tools/* android-sdk/cmdline-tools/latest/ 2>/dev/null || true
-          
-          export ANDROID_SDK_ROOT=$PWD/android-sdk
-          export ANDROID_HOME=$PWD/android-sdk
-          export PATH=$PATH:$ANDROID_SDK_ROOT/cmdline-tools/latest/bin
-          
-          # Accept licenses
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          
-          # Install SDK
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1
+        uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platforms;android-34
+            build-tools;34.0.0
 
       - name: Get Project Source
         id: get_source
         run: |
           if [ -n "${{ github.event.inputs.zip_url }}" ]; then
             echo "📦 Downloading ZIP from: ${{ github.event.inputs.zip_url }}"
-            wget -q -O project.zip "${{ github.event.inputs.zip_url }}" || {
-              echo "❌ Failed to download ZIP"
-              exit 1
-            }
-            unzip -q -o project.zip -d project/ 2>/dev/null || mkdir -p project
-          elif [ -n "${{ github.event.inputs.url }}" ]; then
-            echo "🌐 Using website URL: ${{ github.event.inputs.url }}"
+            wget -q -O project.zip "${{ github.event.inputs.zip_url }}" || echo "ZIP download failed"
+            if [ -f project.zip ]; then
+              unzip -q -o project.zip -d project/
+              rm project.zip
+            fi
+          fi
+          
+          if [ -n "${{ github.event.inputs.url }}" ]; then
+            echo "🌐 Website URL: ${{ github.event.inputs.url }}"
             mkdir -p project
             echo "${{ github.event.inputs.url }}" > project/url.txt
-          else
-            echo "❌ No source provided!"
-            exit 1
           fi
           
           echo "✅ Source ready"
-          ls -la project/ 2>/dev/null || echo "Project folder empty"
 
-      - name: Build WebView APK
+      - name: Check if Flutter Project
+        id: check_flutter
         run: |
-          echo "🔨 Building WebView APK..."
+          if [ -f "project/pubspec.yaml" ]; then
+            echo "✅ Flutter project detected"
+            echo "is_flutter=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Not a Flutter project"
+            echo "is_flutter=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build WebView APK (Non-Flutter)
+        if: steps.check_flutter.outputs.is_flutter == 'false'
+        run: |
+          echo "🔨 Creating Flutter WebView project..."
           
-          # Buat project Flutter baru
           flutter create --org com.web2apk --project-name webview_app webview_app
           cd webview_app
           
-          # Tambah dependency webview
-          cat >> pubspec.yaml << 'EOF'
-          
-            webview_flutter: ^4.8.0
-            webview_flutter_android: ^3.16.0
-          EOF
+          # Overwrite pubspec.yaml (biar gak duplicate key)
+          cat > pubspec.yaml << 'PUBEOF'
+          name: webview_app
+          description: "Web2APK Generated App"
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.2.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            webview_flutter: ^4.7.0
+            webview_flutter_android: ^3.12.0
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          PUBEOF
           
           flutter pub get
           
-          # Buat main.dart dengan WebView
-          cat > lib/main.dart << 'MAINEOF'
+          # Buat main.dart
+          cat > lib/main.dart << 'DARTEOF'
           import 'package:flutter/material.dart';
           import 'package:webview_flutter/webview_flutter.dart';
           import 'package:webview_flutter_android/webview_flutter_android.dart';
 
-          void main() {
-            WidgetsFlutterBinding.ensureInitialized();
-            runApp(const MyApp());
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatefulWidget {
+            const MyApp({super.key});
+            @override
+            State<MyApp> createState() => _MyAppState();
           }
 
-          class MyApp extends StatelessWidget {
-            const MyApp({super.key});
-
+          class _MyAppState extends State<MyApp> {
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'APP_NAME_PLACEHOLDER',
                 debugShowCheckedModeBanner: false,
-                theme: ThemeData(
-                  primarySwatch: Colors.blue,
-                  useMaterial3: true,
-                ),
-                home: const WebViewScreen(),
+                home: const WebViewApp(),
               );
             }
           }
 
-          class WebViewScreen extends StatefulWidget {
-            const WebViewScreen({super.key});
-
+          class WebViewApp extends StatefulWidget {
+            const WebViewApp({super.key});
             @override
-            State<WebViewScreen> createState() => _WebViewScreenState();
+            State<WebViewApp> createState() => _WebViewAppState();
           }
 
-          class _WebViewScreenState extends State<WebViewScreen> {
+          class _WebViewAppState extends State<WebViewApp> {
             late final WebViewController controller;
-            bool isLoading = true;
+            bool loading = true;
 
             @override
             void initState() {
               super.initState();
-              
               controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..setNavigationDelegate(
-                  NavigationDelegate(
-                    onPageStarted: (url) => setState(() => isLoading = true),
-                    onPageFinished: (url) => setState(() => isLoading = false),
-                    onWebResourceError: (error) => print('Web error: ${error.description}'),
-                  ),
-                )
-                ..loadRequest(Uri.parse('URL_PLACEHOLDER'));
+                ..setNavigationDelegate(NavigationDelegate(
+                  onPageFinished: (_) => setState(() => loading = false),
+                ))
+                ..loadRequest(Uri.parse("${{ github.event.inputs.url }}"));
               
-              // Enable Android debugging
               if (controller.platform is AndroidWebViewController) {
                 AndroidWebViewController.enableDebugging(true);
               }
@@ -172,53 +174,50 @@ jobs:
                   child: Stack(
                     children: [
                       WebViewWidget(controller: controller),
-                      if (isLoading)
-                        const Center(
-                          child: CircularProgressIndicator(),
-                        ),
+                      if (loading)
+                        const Center(child: CircularProgressIndicator()),
                     ],
                   ),
                 ),
               );
             }
           }
-          MAINEOF
+          DARTEOF
           
-          # Ganti placeholder
-          sed -i "s/APP_NAME_PLACEHOLDER/${{ github.event.inputs.app_name }}/g" lib/main.dart
-          sed -i "s|URL_PLACEHOLDER|${{ github.event.inputs.url }}|g" lib/main.dart
-          
-          echo "✅ Main.dart ready"
-          
-          # Build APK
           echo "🔨 Building APK..."
-          flutter build apk --release --target-platform android-arm64,android-arm
+          flutter build apk --release
           
+          echo "✅ WebView APK build complete!"
           cd ..
 
-      - name: Find and Prepare APK
+      - name: Build Flutter Project
+        if: steps.check_flutter.outputs.is_flutter == 'true'
         run: |
-          echo "🔍 Mencari APK..."
+          echo "🔨 Building Flutter project..."
+          cd project
+          flutter pub get
+          flutter build apk --release
+          echo "✅ Flutter APK build complete!"
+          cd ..
+
+      - name: Find and Rename APK
+        run: |
+          echo "🔍 Searching for APK..."
           
-          # Cari semua APK
-          find . -name "*.apk" -type f -ls
-          
-          # Cari APK release
-          APK_PATH=$(find . -path "*/release/*.apk" -o -name "app-release.apk" | head -1)
-          
-          if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find . -name "*.apk" -type f | head -1)
-          fi
+          # Cari APK di semua folder
+          APK_PATH=$(find . -name "*.apk" -type f | head -1)
           
           if [ -n "$APK_PATH" ]; then
-            echo "✅ APK ditemukan: $APK_PATH"
+            echo "✅ APK found: $APK_PATH"
             cp "$APK_PATH" "${{ github.event.inputs.app_name }}.apk"
-            ls -lh "${{ github.event.inputs.app_name }}.apk"
-            echo "✅ APK size: $(du -h ${{ github.event.inputs.app_name }}.apk | cut -f1)"
+            echo "📦 APK size: $(du -h ${{ github.event.inputs.app_name }}.apk | cut -f1)"
           else
-            echo "❌ APK tidak ditemukan!"
-            echo "Isi folder:"
-            find . -type d -maxdepth 4
+            echo "❌ No APK found!"
+            echo "Listing all files:"
+            find . -type f -name "*.apk" 2>/dev/null
+            echo ""
+            echo "Build folders:"
+            find . -type d -name "build" 2>/dev/null
             exit 1
           fi
 
@@ -230,14 +229,14 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Notify Success
+      - name: Build Success
         if: success()
         run: |
-          echo "✅ Build sukses!"
+          echo "🎉 BUILD SUCCESS!"
           echo "APK: ${{ github.event.inputs.app_name }}.apk"
 
-      - name: Notify Failed
+      - name: Build Failed
         if: failure()
         run: |
-          echo "❌ Build gagal!"
-          echo "Cek log di atas untuk detail error"
+          echo "💀 BUILD FAILED!"
+          echo "Check logs above for errors"
